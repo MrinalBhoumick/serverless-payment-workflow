@@ -1,0 +1,40 @@
+{
+    "Comment": "Enhanced payment processing workflow triggered via API Gateway",
+    "StartAt": "ValidatePayment",
+    "States": {
+        "ValidatePayment": {
+            "Type": "Task",
+            "Resource": "${ValidatePaymentFunction.Arn}",
+            "ResultPath": "$.validation_result",  // Save output from ValidatePayment Lambda
+            "Next": "ProcessPayment"
+        },
+        "ProcessPayment": {
+            "Type": "Task",
+            "Resource": "${ProcessPaymentFunction.Arn}",
+            "InputPath": "$.validation_result",  // Input from ValidatePayment
+            "ResultPath": "$.payment_result",    // Save output from ProcessPayment Lambda
+            "Next": "UpdatePaymentStatus"
+        },
+        "UpdatePaymentStatus": {
+            "Type": "Task",
+            "Resource": "${UpdatePaymentStatusFunction.Arn}",
+            "InputPath": "$.payment_result",    // Input from ProcessPayment
+            "ResultPath": "$.update_status_result",  // Save output from UpdatePaymentStatus Lambda
+            "Next": "SendNotification"
+        },
+        "SendNotification": {
+            "Type": "Task",
+            "Resource": "${SendNotificationFunction.Arn}",
+            "InputPath": "$.update_status_result",  // Input from UpdatePaymentStatus
+            "ResultPath": "$.notification_result",  // Save output from SendNotification Lambda
+            "End": true
+        },
+        "HandlePaymentError": {
+            "Type": "Task",
+            "Resource": "${HandlePaymentErrorFunction.Arn}",
+            "InputPath": "$.error_info",  // Error info passed from ProcessPayment on failure
+            "ResultPath": "$.error_handling_result",
+            "Next": "UpdatePaymentStatus"
+        }
+    }
+}

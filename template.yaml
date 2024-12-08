@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Resources:
+  ValidatePaymentFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: validate_payment.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  ProcessPaymentFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: process_payment.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'sns:Publish'
+                - 'sns:List*'
+              Resource: !Ref OrderNotificationsTopic
+            - Effect: Allow
+              Action:
+                - 'dynamodb:PutItem'
+                - 'dynamodb:UpdateItem'
+              Resource: !GetAtt OrdersTable.Arn
+
+  UpdatePaymentStatusFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: update_payment_status.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'dynamodb:PutItem'
+                - 'dynamodb:UpdateItem'
+              Resource: !GetAtt OrdersTable.Arn
+
+  SendNotificationFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: send_notification.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'sns:List*'
+                - 'sns:Publish'
+              Resource: !Ref OrderNotificationsTopic
+
+  HandlePaymentErrorFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: handle_payment_error.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  OrdersTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: Orders
+      AttributeDefinitions:
+        - AttributeName: PaymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PaymentId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  OrderNotificationsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: OrderNotifications
+
+  PaymentProcessingStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "Comment": "Payment processing workflow triggered via API Gateway",
+          "StartAt": "ValidatePayment",
+          "States": {
+            "ValidatePayment": {
+              "Type": "Task",
+              "Resource": "${ValidatePaymentFunction.Arn}",
+              "Next": "ProcessPayment"
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "${ProcessPaymentFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["TransientError"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandlePaymentError"
+                }
+              ],
+              "Next": "UpdatePaymentStatus"
+            },
+            "UpdatePaymentStatus": {
+              "Type": "Task",
+              "Resource": "${UpdatePaymentStatusFunction.Arn}",
+              "Next": "SendNotification"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "${SendNotificationFunction.Arn}",
+              "End": true
+            },
+            "HandlePaymentError": {
+              "Type": "Task",
+              "Resource": "${HandlePaymentErrorFunction.Arn}",
+              "Next": "UpdatePaymentStatus"
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'states.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt ValidatePaymentFunction.Arn
+                  - !GetAtt ProcessPaymentFunction.Arn
+                  - !GetAtt UpdatePaymentStatusFunction.Arn
+                  - !GetAtt SendNotificationFunction.Arn
+                  - !GetAtt HandlePaymentErrorFunction.Arn
+
+  PaymentAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: 'PaymentAPI'
+          version: '1.0'
+        paths:
+          /startPayment:
+            post:
+              summary: 'Initiate Payment Processing'
+              description: 'Initiate the payment processing workflow in Step Functions.'
+              consumes:
+                - 'application/json'
+              produces:
+                - 'application/json'
+              parameters:
+                - in: 'body'
+                  name: 'body'
+                  required: true
+                  schema:
+                    type: 'object'
+                    properties:
+                      payment_details:
+                        type: 'object'
+                        properties:
+                          card_number:
+                            type: 'string'
+                            description: 'The card number for payment.'
+                          expiry_date:
+                            type: 'string'
+                            description: 'The expiry date of the card (MM/YY format).'
+                          cvv:
+                            type: 'string'
+                            description: 'The CVV code of the card.'
+                          amount:
+                            type: 'number'
+                            description: 'The amount to be paid.'
+              responses:
+                '200':
+                  description: 'Successful response'
+                  schema:
+                    type: 'object'
+                    properties:
+                      statusCode:
+                        type: 'integer'
+                      body:
+                        type: 'string'
+              x-amazon-apigateway-integration:
+                type: 'AWS'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/StartExecution'
+                credentials: !GetAtt PaymentAPIGWRole.Arn
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "stateMachineArn": "${PaymentProcessingStateMachine}",
+                      "input": "$util.escapeJavaScript($input.json('$'))"
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: |
+                        {
+                          "statusCode": 200,
+                          "body": $input.json('$.output')
+                        }
+
+  PaymentAPIGWRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'apigateway.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ApiGatewayInvokeStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: !Ref PaymentProcessingStateMachine
+
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${PaymentAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod/startPayment"
